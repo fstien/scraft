@@ -26,6 +26,21 @@ const (
 
 var state = follower
 var term = 0
+var leaderId string
+
+var KVs = map[string]string{}
+
+type command struct {
+	key string
+	val string
+
+	rsp chan error
+}
+
+var cLog = []command{}
+
+var proposal = make(chan command)
+var commitIdx = 0
 
 type member struct {
 	id   string
@@ -101,11 +116,44 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		log.Printf("Received append-entries request from %s, term %d\n", id, termInt)
+		//log.Printf("Received append-entries request from %s, term %d\n", id, termInt)
 
 		lastHeartbeat = time.Now()
-		term = termInt
-		log.Printf("Updated term to %d\n", termInt)
+		leaderId = id
+
+		if termInt != term {
+			term = termInt
+			log.Printf("Updated term to %d\n", termInt)
+		}
+
+		// handle request
+
+		key := r.URL.Query().Get("key")
+		val := r.URL.Query().Get("val")
+
+		if key != "" && val != "" {
+			log.Printf("Received key %s with val %s\n", key, val)
+			cLog = append(cLog, command{key: key, val: val})
+		}
+
+		commitIdxStr := r.URL.Query().Get("commitIdx")
+		if commitIdxStr == "" {
+			log.Printf("Commit index not found\n")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		idx, err := strconv.Atoi(commitIdxStr)
+		if err != nil {
+			log.Printf("Commit index not a number\n")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if idx > commitIdx {
+			log.Printf("Commit index updated to %d\n", idx)
+			commitIdx = idx
+			cmd := cLog[commitIdx-1]
+			KVs[cmd.key] = cmd.val
+		}
 
 	} else if r.URL.Path == "/request-vote" {
 		t := r.URL.Query().Get("term")
@@ -128,15 +176,17 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		log.Printf("Received request from %s, term %d, id %s\n", r.RemoteAddr, termInt, id)
+		//log.Printf("Received request from %s, term %d, id %s\n", r.RemoteAddr, termInt, id)
 
 		if termInt < term {
 			log.Printf("Term is less than current term, rejecting vote request\n")
 			w.Write([]byte("false"))
 			return
 		} else {
-			term = termInt
-			log.Printf("Updated term to %d\n", termInt)
+			if termInt > term {
+				term = termInt
+				log.Printf("Updated term to %d\n", termInt)
+			}
 			if state != follower {
 				stepDown <- struct{}{}
 			}
@@ -151,6 +201,108 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+	} else if r.URL.Path == "/set" {
+		if state != leader {
+			// forward request to leader
+			log.Printf("Forwarding request to leader\n")
+			if leaderId == "" {
+				log.Printf("No leader found\n")
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			leaderAddr := ""
+			for _, m := range members {
+				if m.id == leaderId {
+					leaderAddr = m.addr
+					break
+				}
+			}
+
+			if leaderAddr == "" {
+				log.Printf("Leader not found in members\n")
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			key := r.URL.Query().Get("key")
+			if key == "" {
+				log.Printf("Key not found\n")
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			val := r.URL.Query().Get("val")
+			if val == "" {
+				log.Printf("Val not found\n")
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			url := fmt.Sprintf("http://%s/set?key=%s&val=%s", leaderAddr, key, val)
+			log.Printf("Forwarding request to leader: %s\n", url)
+			_, err := http.Get(url)
+			if err != nil {
+				log.Printf("Failed to forward request to leader: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			return
+		}
+
+		// handle request
+
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			log.Printf("Key not found\n")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		val := r.URL.Query().Get("val")
+		if val == "" {
+			log.Printf("Val not found\n")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		rsp := make(chan error)
+		log.Printf("Proposing key %s with val %s\n", key, val)
+		proposal <- command{key: key, val: val, rsp: rsp}
+		log.Printf("Waiting for response\n")
+
+		select {
+		case err := <-rsp:
+			if err != nil {
+				log.Printf("Failed to set key %s: %v\n", key, err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		case <-time.After(1 * time.Second):
+			log.Printf("Failed to set key %s: timeout\n", key)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	} else if r.URL.Path == "/get" {
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			log.Printf("Invalid key\n")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		val, ok := KVs[key]
+		if !ok {
+			log.Printf("Key not found\n")
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		w.Write([]byte(val))
+		return
 	} else {
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -213,15 +365,17 @@ func runFollower() {
 	log.Printf("Running as follower...")
 	for {
 		electionTimeout := time.Duration(200+rand.Intn(300)) * time.Millisecond
-		log.Printf("sleeping for %v", electionTimeout)
-		time.Sleep(electionTimeout)
+		// log.Printf("sleeping for %v", electionTimeout)
 
-		if time.Since(lastHeartbeat) > electionTimeout {
-			log.Printf("Starting election, becoming candidate")
-			state = candidate
-			log.Printf("Incrementing term to %d", term+1)
-			term++
-			return
+		select {
+		case <-time.After(electionTimeout):
+			if time.Since(lastHeartbeat) > electionTimeout {
+				log.Printf("Starting election, becoming candidate")
+				state = candidate
+				log.Printf("Incrementing term to %d", term+1)
+				term++
+				return
+			}
 		}
 	}
 }
@@ -299,10 +453,53 @@ func runCandidate() {
 func runLeader() {
 	log.Printf("Running as leader...")
 
+	go func() {
+		for {
+			select {
+			case c := <-proposal:
+				log.Printf("Received proposal %v", c)
+				cLog = append(cLog, c)
+				votes := 1
+				voteCh := make(chan bool, 2)
+				for _, m := range members {
+					go func(m member) {
+						url := fmt.Sprintf("http://%s/append-entries?term=%d&id=%s&commitIdx=%d&key=%s&val=%s", m.addr, term, id, commitIdx, c.key, c.val)
+
+						log.Printf("Replicating to %v, url= %s \n", m, url)
+
+						_, err := http.Get(url)
+						if err != nil {
+							log.Printf("Failed to replicate to %s: %v", m.addr, err)
+							return
+						}
+						log.Printf("Replicated to %s", m.addr)
+						voteCh <- true
+					}(m)
+				}
+
+			LOOP:
+				for {
+					select {
+					case vote := <-voteCh:
+						if vote {
+							votes++
+							if votes > len(members)/2 {
+								commitIdx++
+								KVs[c.key] = c.val
+								c.rsp <- nil
+								break LOOP
+							}
+						}
+					}
+				}
+			}
+		}
+	}()
+
 	for {
 		for _, m := range members {
 			go func(m member) {
-				resp, err := http.Get(fmt.Sprintf("http://%s/append-entries?term=%d&id=%s", m.addr, term, id))
+				resp, err := http.Get(fmt.Sprintf("http://%s/append-entries?term=%d&id=%s&commitIdx=%d", m.addr, term, id, commitIdx))
 				if err != nil {
 					log.Printf("Failed to send heartbeat to %s: %v", m.addr, err)
 					return
@@ -314,12 +511,11 @@ func runLeader() {
 					return
 				}
 
-				log.Printf("Sent heartbeat to %s", m.addr)
+				//log.Printf("Sent heartbeat to %s", m.addr)
 			}(m)
 		}
 
 		heartBeatInterval := time.Duration(100+rand.Intn(50)) * time.Millisecond
 		time.Sleep(heartBeatInterval)
 	}
-
 }
